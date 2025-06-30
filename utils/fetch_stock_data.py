@@ -109,7 +109,7 @@ def upload_file_to_s3(access_key, secret_key, local_file_path, bucket_name, s3_k
         s3.upload_file(local_file_path, bucket_name, s3_key)
         print(f"Uploaded '{local_file_path}' to s3://{bucket_name}/{s3_key}")
     except Exception as e:
-        print(f"❌ Failed to upload to S3: {e}")
+        print(f"Failed to upload to S3: {e}")
 
 def clean_data(df):
     """
@@ -198,7 +198,7 @@ def fetch_stock_data(tickers, start_date, end_date, access_key, secret_key, buck
         data = clean_data(data)
 
         # Save file locally
-        # data.to_csv(filename, index = False)
+        data.to_csv(filename, index = False)
         print(f"Sucessfully saved data to {filename}")
 
         # Check if bucket name is specified
