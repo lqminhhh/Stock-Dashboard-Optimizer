@@ -6,12 +6,14 @@ st.set_page_config(layout="wide", initial_sidebar_state="collapsed")
 import pandas as pd, yfinance as yf, datetime, plotly.graph_objects as go, plotly.express as px
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pygooglenews import GoogleNews
+import os
 
 # ──────────────────────────────  DATA  ───────────────────────────────────────────
-df_tickers = pd.read_csv(
-    r"c:/Users/tienv/Documents/Stock-Dashboard-Optimizer/data/S&P500.csv",
-    encoding="latin1"
-)
+# Get the absolute path to the CSV file relative to this script
+current_dir = os.path.dirname(__file__)  # dev/
+csv_path = os.path.abspath(os.path.join(current_dir, "..", "data", "S&P500.csv"))
+# Read the CSV
+df_tickers = pd.read_csv(csv_path, encoding="latin1")
 
 tickers = df_tickers["Symbol"].dropna().unique()
 ticker_to_name = dict(zip(df_tickers["Symbol"], df_tickers["Security"]))
