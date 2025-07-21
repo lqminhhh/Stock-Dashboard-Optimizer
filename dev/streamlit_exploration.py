@@ -72,6 +72,8 @@ if selected == "Individual Information":
         rsi_period = st.selectbox("RSI Period (days)", [7,14,30], index=1)
         ma_period  = st.selectbox("Volume Moving Average (days)", [7,14,21,30], index=1)
 
+    company_name = ticker_to_name.get(ticker, ticker)
+
     # ------------- helper to flatten MultiIndex from yfinance ------------------
     def extract_single_ticker(df: pd.DataFrame, tkr: str) -> pd.DataFrame:
         if df.empty:
@@ -129,7 +131,7 @@ if selected == "Individual Information":
     c5.metric("All-Time Low",  f"${a_low:.2f}", help=f"on {low_date}")
 
     st.markdown("---")
-    st.subheader(f"{ticker} — {start_date:%b %d, %Y} to {end_date:%b %d, %Y}")
+    st.subheader(f"{company_name} — {start_date:%b %d, %Y} to {end_date:%b %d, %Y}")
 
     if start_date >= end_date:
         st.error("Start Date must be earlier than End Date")
