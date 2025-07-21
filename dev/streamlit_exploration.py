@@ -3,7 +3,7 @@ from streamlit_option_menu import option_menu
 
 st.set_page_config(layout="wide", initial_sidebar_state="collapsed")
 
-
+import datetime
 import pandas as pd, yfinance as yf, datetime, plotly.graph_objects as go, plotly.express as px
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pygooglenews import GoogleNews
@@ -129,6 +129,8 @@ if selected == "Individual Information":
     c3.metric("Volume (M)", f"{trading_volume/1e6:.2f}", delta=f"{(trading_volume-y_vol)/y_vol:.2%}")
     c4.metric("All-Time High", f"${a_high:.2f}", help=f"on {high_date}")
     c5.metric("All-Time Low",  f"${a_low:.2f}", help=f"on {low_date}")
+
+    st.caption(f"Data last updated: {datetime.datetime.now():%b %d, %Y – %H:%M:%S}")
 
     st.markdown("---")
     st.subheader(f"{company_name} — {start_date:%b %d, %Y} to {end_date:%b %d, %Y}")
@@ -284,7 +286,12 @@ if selected == "General Information":
         industries = st.multiselect("Industry filter", options=df_tickers["GICS Sub-Industry"].unique(), default=None)
 
     # 2) Download today’s OHLCV for all tickers
-    all_data = yf.download(tickers.tolist(), period="1d", threads=True, progress=False)
+    with st.spinner("Fetching market data…"):
+        try:
+            all_data = yf.download(tickers.tolist(), period="1d", threads=True, progress=False)
+        except Exception as e:
+            st.error(f"Data fetch failed: {e}")
+            st.stop()
 
     # 3) Extract first (and only) row of Open/Close/Volume
     if isinstance(all_data.columns, pd.MultiIndex):
@@ -333,24 +340,8 @@ if selected == "General Information":
     with row3:
         st.metric("📊 Total Volume (M)", f"{total_volume:.2f}")
 
-    # 7) Optional: Bar chart of sector performance
-    fig_sec = px.bar(
-        sector_perf.sort_values(ascending=False).reset_index(),
-        x="GICS Sector", y="pct_change",
-        title="Sector % Change Today",
-        labels={"pct_change": "% Change"},
-    )
-
-
-    fig_sec.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        yaxis_tickformat=".1%",    # <-- display axis in percent (e.g. 1.2%)
-        yaxis_title="% Change"
-    )
-
-    st.plotly_chart(fig_sec, use_container_width=True, height=300)
-
+    st.caption(f"Data last updated: {datetime.datetime.now():%b %d, %Y – %H:%M:%S}")
+    
     # ─── 8) Top/Bottom N performers tables ─────────────────────────────────────
     # 8a) Prepare tables
     perf = df.assign(Price=closes)[["Price","pct_change"]].rename(columns={"pct_change":"% Change"})
