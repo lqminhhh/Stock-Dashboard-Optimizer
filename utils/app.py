@@ -15,7 +15,7 @@ import boto3
 import json
 from io import StringIO
 from textblob import TextBlob
-
+from stock_optimizer import prep_data, optimize_max_return, optimize_min_variance
 
 
 # ──────────────────────────────  DATA  ───────────────────────────────────────────
@@ -180,11 +180,9 @@ if selected == "Individual Information":
     low_date         = df_tkr["Low"].idxmin().strftime("%B %d, %Y")
 
     # 5) KPI cards
-    c_company, c_industry, c1, c2, c3, c4, c5 = st.columns([1,1,1,1,1,1,1], gap="large")
+    c_company, c1, c2, c3, c4, c5 = st.columns([1,1,1,1,1,1], gap="large")
     with c_company:
         st.metric("Company", company_name)
-    with c_industry:
-        st.metric("Industry", industry)
     with c1:
         st.metric("Open", f"${today_open:.2f}", delta=f"{(today_open-y_open)/y_open:.2%}")
     with c2:
@@ -304,7 +302,7 @@ if selected == "Individual Information":
         line=dict(width=2),
     ))
     vol_fig.update_layout(
-        title=f"V O L U M E   &   {ma_period} - D A Y   M O V I N G   A V E R A G E",
+        title=f"Volume and {ma_period}-day Moving Average",
         xaxis_title="Date",
         yaxis_title="Volume",
         legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
@@ -336,7 +334,7 @@ if selected == "Individual Information":
                       annotation_text="Oversold", annotation_position="bottom left",
                       annotation_font_color="white")
     rsi_fig.update_layout(
-        title="R E L A T I V E   S T R E N G T H   I N D E X",
+        title = "Relative Strength Index",
         xaxis_title="Date",
         yaxis_title="RSI",
         yaxis=dict(range=[0, 100]),
@@ -409,17 +407,14 @@ if selected == "General Information":
     bottom_sector   = sector_pct_idx.idxmin()
     top_industry    = subind_pct_idx.idxmax()
     bottom_industry = subind_pct_idx.idxmin()
-    total_volume    = df["volume"].sum() / 1_000_000  # millions
 
-    row1, row2, row3 = st.columns([3,3,1], gap="large")
+    row1, row2 = st.columns([2, 2], gap="large")
     with row1:
         st.metric("🏆 Top Sector",    top_sector,       f"{sector_pct_idx[top_sector]:.2%}")
-        st.metric("🥇 Top Industry",  top_industry,     f"{subind_pct_idx[top_industry]:.2%}")
-    with row2:
         st.metric("🏴 Bottom Sector", bottom_sector,    f"{sector_pct_idx[bottom_sector]:.2%}")
+    with row2:
+        st.metric("🥇 Top Industry",  top_industry,     f"{subind_pct_idx[top_industry]:.2%}")
         st.metric("🥈 Bottom Industry", bottom_industry,f"{subind_pct_idx[bottom_industry]:.2%}")
-    with row3:
-        st.metric("📊 Total Volume (M)", f"{total_volume:.2f}")
     st.caption(f"Data last updated: {datetime.datetime.now():%b %d, %Y – %H:%M:%S}")
 
     st.markdown("---")
@@ -564,14 +559,15 @@ if selected == "News":
             st.warning(f"No articles found containing '{keyword_filter}'.")
             st.stop()
 
-    # We will analyze and display the top 10 articles
-    df_display = df_news.head(10).copy()
+    # We will analyze and display the top 50 articles
+    df_display = df_news.head(50).copy()
 
     # ───────── SENTIMENT ANALYSIS ─────────────────
     df_display["text_for_analysis"] = (
         df_display["title"].astype(str) + ". " +
         df_display["summary"].astype(str)
     )
+    
     sentiments = df_display["text_for_analysis"].apply(lambda txt: TextBlob(txt).sentiment)
     df_display["polarity"]     = sentiments.apply(lambda s: s.polarity)
     avg_polarity = df_display["polarity"].mean()
@@ -625,4 +621,64 @@ if selected == "News":
         mime="text/csv",
     )
 
-# if selected == 'Portfolio Optimizer':
+if selected == 'Portfolio Optimizer':
+    st.title("PORTFOLIO OPTIMIZATION")
+
+    with st.sidebar:
+        st.header("Optimization Settings")
+
+        capital = st.sidebar.number_input("Investment Capital ($)", min_value=1000, value=20000, step=1000)
+        optimizer_type = st.sidebar.radio("Optimization Objective", ["Minimize Risk", "Maximize Return"])
+        allow_short = st.sidebar.checkbox("Allow Short Selling?", value=False)
+
+    min_return = None
+    max_volatility = None
+    if optimizer_type == "Minimize Risk":
+        min_return = st.sidebar.number_input("Optional: Minimum Expected Return (%)", min_value=0.0, max_value=100.0, step=0.1, value=0.0) / 100
+    else:
+        max_volatility = st.sidebar.number_input("Optional: Maximum Volatility (%)", min_value=0.0, max_value=100.0, step=0.1, value=20.0) / 100
+    
+    full_df  = load_stock_data_from_s3(bucket_name, s3_key)
+    tickers = sorted(full_df['Ticker'].unique().tolist())
+    selected_tickers = st.multiselect("Select tickers to include in the portfolio:", tickers, default=tickers[:8])
+
+    if selected_tickers:
+        df_prepped = prep_data(full_df, selected_tickers)
+
+        if optimizer_type == "Minimize Risk":
+            result = optimize_min_variance(
+                df_prepped,
+                capital=capital,
+                allow_short=allow_short,
+                min_return=min_return if min_return > 0 else None,
+                verbose=False
+            )
+        else:
+            result = optimize_max_return(
+                df_prepped,
+                capital=capital,
+                allow_short=allow_short,
+                max_volatility=max_volatility,
+                verbose=False
+            )
+        # Friendly summary
+        total_return_dollars = result["expected_return"] * capital
+        summary_text = (
+            f"💡 If you invest \${capital:}, your optimized portfolio is expected to earn "
+            f"**${total_return_dollars:,.2f} annually**, with a projected return of **{result['expected_return']:.2%}** "
+            f"and risk (volatility) of **{result['volatility']:.2%}**.\n\n"
+            f"Here's how your capital would be allocated across the selected stocks:"
+        )
+
+        st.subheader(summary_text)
+
+        st.subheader("📊 Portfolio Metrics")
+        col1, col2, col3, col4, col5 = st.columns(5)
+        col1.metric("Expected Return", f"{result['expected_return']:.2%}")
+        col2.metric("Volatility", f"{result['volatility']:.2%}")
+        col3.metric("Sharpe Ratio", f"{result['sharpe_ratio']:.2f}")
+        col4.metric("Value at Risk (5%)", f"-{abs(result['VaR_5']):.2%}")
+        col5.metric("Conditional VaR (5%)", f"-{abs(result['CVaR_5']):.2%}")
+
+        st.subheader("📈 Optimized Portfolio Allocation")
+        st.dataframe(result["allocations"].style.format({"Dollars": "$ {:.2f}", "Weight": "{:.2%}"}))
