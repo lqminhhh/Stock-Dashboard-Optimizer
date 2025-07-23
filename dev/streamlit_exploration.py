@@ -4,37 +4,83 @@ from streamlit_option_menu import option_menu
 st.set_page_config(layout="wide", initial_sidebar_state="collapsed")
 
 import datetime
-import pandas as pd, yfinance as yf, datetime, plotly.graph_objects as go, plotly.express as px
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pygooglenews import GoogleNews
 import os
+import boto3
+import json
+from io import StringIO
+from textblob import TextBlob
+
+
 
 # ──────────────────────────────  DATA  ───────────────────────────────────────────
-# Get the absolute path to the CSV file relative to this script
-current_dir = os.path.dirname(__file__)  # dev/
-csv_path = os.path.abspath(os.path.join(current_dir, "..", "data", "S&P500.csv"))
-# Read the CSV
-df_tickers = pd.read_csv(csv_path, encoding="latin1")
+def load_aws_credentials():
+    """
+    Load AWS keys from environment or ../private/config.json
+    """
+    access_key = os.getenv("AWS_ACCESS_KEY_ID")
+    secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+    if access_key and secret_key:
+        return access_key, secret_key
 
-tickers = df_tickers["Symbol"].dropna().unique()
+    # fallback to config file
+    config_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "private", "config.json")
+    )
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            keys = json.load(f)
+        return keys["aws_access_key_id"], keys["aws_secret_access_key"]
+
+    st.error(
+        "AWS credentials not found. "
+        "Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY as environment variables "
+        "or place a config.json under ../private/config.json"
+    )
+    st.stop()
+
+@st.cache_data
+def load_stock_data_from_s3(bucket_name: str, s3_key: str) -> pd.DataFrame:
+    """
+    Fetches the long-format OHLCV CSV from S3 and returns a DataFrame
+    with columns [Date, Type, Ticker, Price].
+    """
+    access_key, secret_key = load_aws_credentials()
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key
+    )
+    obj = s3.get_object(Bucket=bucket_name, Key=s3_key)
+    data = obj["Body"].read().decode("utf-8")
+    df = pd.read_csv(StringIO(data), parse_dates=["Date"])
+    return df
+
+# ─────────────────────────────  TICKER METADATA  ───────────────────────────────
+current_dir = os.path.dirname(__file__)
+csv_path   = os.path.abspath(os.path.join(current_dir, "..", "data", "S&P500.csv"))
+df_tickers = pd.read_csv(csv_path, encoding="latin1")
+tickers    = df_tickers["Symbol"].dropna().astype(str).tolist()
 ticker_to_name = dict(zip(df_tickers["Symbol"], df_tickers["Security"]))
 
+# ─────────────────────── S3 SNAPSHOT CONFIG ──────────────────────────────────
+bucket_name = "yfinancestockdata"
+s3_key      = "snapshots/stock_data_2023-01-01_to_2025-06-29.csv"
+
 # ──────────────────────────────  SIDEBAR  ────────────────────────────────────────
-    # ─── Main Navigation ──────────────────────────────────────────────────────
+
 with st.sidebar:
     selected = option_menu(
-            menu_title="Navigation",
-            options=[
-                "General Information",
-                "Individual Information",
-                "News",
-                "Portfolio Optimizer",
-            ],
-            icons=["bar-chart-line", "list-columns-reverse", "newspaper", "gear"],  # lucide icons
-            menu_icon="cast",
-            default_index=0,
-        )
-
+        menu_title="Navigation",
+        options=["General Information", "Individual Information", "News", "Portfolio Optimizer"],
+        icons=["bar-chart-line", "list-columns-reverse", "newspaper", "gear"],
+        menu_icon="cast",
+        default_index=0,
+    )
     st.markdown("---")
 
 # ──────────────────────────────  NEWS CACHE  ─────────────────────────────────────
@@ -60,78 +106,68 @@ def load_news(tkr: str, company: str, days: int = 7) -> pd.DataFrame:
 
     return df[final_cols]
 
+
 # ─────────────────────  INDIVIDUAL INFORMATION  ─────────────────────────────────
 if selected == "Individual Information":
     st.title("DETAILED STOCK INFORMATION")
 
+    # 1) Load full history so we know our date bounds
+    full_df  = load_stock_data_from_s3(bucket_name, s3_key)
+    min_date = full_df["Date"].min().date()
+    max_date = full_df["Date"].max().date()
+
+    # 2) Sidebar inputs for ticker, date range, and periods
     with st.sidebar:
         st.header("🔎 Select Parameters")
-        ticker = st.selectbox("Ticker", tickers, index= tickers.tolist().index("AAPL"))  # default if you like
-        start_date = st.date_input("Start Date", value=pd.to_datetime("2023-01-01"))
-        end_date   = st.date_input("End Date",   value=pd.Timestamp.today())
-        rsi_period = st.selectbox("RSI Period (days)", [7,14,30], index=1)
-        ma_period  = st.selectbox("Volume Moving Average (days)", [7,14,21,30], index=1)
+        ticker      = st.selectbox("Ticker", tickers, index=tickers.index("AAPL"))
+        start_date  = st.date_input("Start Date", value=min_date,  min_value=min_date,  max_value=max_date)
+        end_date    = st.date_input("End Date",   value=max_date,  min_value=min_date,  max_value=max_date)
+        ma_period   = st.selectbox("Volume MA (days)", [7, 14, 21, 30], index=1)
+        rsi_period  = st.selectbox("RSI Period (days)",   [7, 14, 30],       index=1)
 
-    company_name = ticker_to_name.get(ticker, ticker)
-
-    # ------------- helper to flatten MultiIndex from yfinance ------------------
-    def extract_single_ticker(df: pd.DataFrame, tkr: str) -> pd.DataFrame:
-        if df.empty:
-            raise ValueError("Received empty DataFrame from yfinance.")
-
-        if not isinstance(df.columns, pd.MultiIndex):
-            return df  # already a single‑ticker frame
-
-        # find which level contains the ticker symbol
-        for lvl in range(df.columns.nlevels):
-            if tkr in df.columns.get_level_values(lvl):
-                return df.xs(tkr, level=lvl, axis=1)
-
-        raise KeyError(f"{tkr} not found in downloaded data.")
-
-
-    # ------------- today vs yesterday ------------------------------------------
-    raw_latest = yf.download(ticker, period="1d", threads=False)
-    latest = extract_single_ticker(raw_latest, ticker)
-
-    if latest.empty:
-        st.error("No intraday data returned.")
-        st.stop()
-
-    today_open, today_close, trading_volume = (
-        float(latest["Open"].iloc[0]),
-        float(latest["Close"].iloc[0]),
-        int(latest["Volume"].iloc[0]),
+    # 3) Pivot your S3 data into an OHLCV DataFrame for this ticker
+    df_tkr = (
+        full_df
+        .query("Ticker == @ticker")
+        .pivot(index="Date", columns="Type", values="Price")
+        .sort_index()
     )
 
-    raw_hist = yf.download(ticker, period="5d", threads=False)
-    hist = extract_single_ticker(raw_hist, ticker)
-    if hist.shape[0] < 2:
-        st.error("Not enough history for yesterday’s metrics.")
-        st.stop()
-    yest = hist.iloc[-2]
+    # extra metadata
+    company_name = ticker_to_name.get(ticker, ticker)
+    industry_arr = df_tickers.loc[df_tickers["Symbol"] == ticker, "GICS Sub-Industry"].values
+    industry     = industry_arr[0] if len(industry_arr) else "N/A"
+
+    # 4) Compute summary metrics
+    latest           = df_tkr.iloc[-1]
+    yest             = df_tkr.iloc[-2]
+    today_open       = float(latest["Open"])
+    today_close      = float(latest["Close"])
+    trading_volume   = int(latest["Volume"])
     y_open, y_close, y_vol = float(yest["Open"]), float(yest["Close"]), int(yest["Volume"])
+    a_high           = float(df_tkr["High"].max())
+    a_low            = float(df_tkr["Low"].min())
+    high_date        = df_tkr["High"].idxmax().strftime("%B %d, %Y")
+    low_date         = df_tkr["Low"].idxmin().strftime("%B %d, %Y")
 
-    # ------------- all‑time high / low ------------------------------------------
-    # Replace this block
-    raw_all_data = yf.download(ticker, start="2000-01-01", threads=False)
-    all_data = extract_single_ticker(raw_all_data, ticker)
-    all_data.index = pd.to_datetime(all_data.index)
-
-    a_high, a_low = float(all_data["High"].max()), float(all_data["Low"].min())
-    high_date = all_data["High"].idxmax().strftime("%B %d, %Y")
-    low_date = all_data["Low"].idxmin().strftime("%B %d, %Y")
-
-    # ------------- KPI cards ----------------------------------------------------
-    c1, c2, c3, c4, c5 = st.columns([1,1,1,1,1], gap="small")
-    c1.metric("Open", f"${today_open:.2f}", delta=f"{(today_open-y_open)/y_open:.2%}")
-    c2.metric("Close", f"${today_close:.2f}", delta=f"{(today_close-y_close)/y_close:.2%}")
-    c3.metric("Volume (M)", f"{trading_volume/1e6:.2f}", delta=f"{(trading_volume-y_vol)/y_vol:.2%}")
-    c4.metric("All-Time High", f"${a_high:.2f}", help=f"on {high_date}")
-    c5.metric("All-Time Low",  f"${a_low:.2f}", help=f"on {low_date}")
+    # 5) KPI cards
+    c_company, c_industry, c1, c2, c3, c4, c5 = st.columns([1,1,1,1,1,1,1], gap="large")
+    with c_company:
+        st.metric("Company", company_name)
+    with c_industry:
+        st.metric("Industry", industry)
+    with c1:
+        st.metric("Open", f"${today_open:.2f}", delta=f"{(today_open-y_open)/y_open:.2%}")
+    with c2:
+        st.metric("Close", f"${today_close:.2f}", delta=f"{(today_close-y_close)/y_close:.2%}")
+    with c3:
+        st.metric("Volume (M)", f"{trading_volume/1e6:.2f}", delta=f"{(trading_volume-y_vol)/y_vol:.2%}")
+    with c4:
+        st.metric("High", f"${a_high:.2f}", help=f"on {high_date}")
+    with c5:
+        st.metric("Low", f"${a_low:.2f}",  help=f"on {low_date}")
 
     st.caption(f"Data last updated: {datetime.datetime.now():%b %d, %Y – %H:%M:%S}")
-
     st.markdown("---")
     st.subheader(f"{company_name} — {start_date:%b %d, %Y} to {end_date:%b %d, %Y}")
 
@@ -139,52 +175,98 @@ if selected == "Individual Information":
         st.error("Start Date must be earlier than End Date")
         st.stop()
 
-    # --- Download & flatten data ---
-    raw_user_data = yf.download(ticker, start=start_date, end=end_date, threads=False)
-    user_data     = extract_single_ticker(raw_user_data, ticker)
+    # 6) Slice user_data for charts
+    user_data = df_tkr.loc[start_date:end_date]
 
-    if user_data.empty or user_data.shape[0] < 2:
-        st.warning("Not enough data for that range")
-        st.stop()
-
-    # compute rolling average
-    user_data[f"Vol_MA_{ma_period}"] = (
-        user_data["Volume"]
-        .rolling(window=ma_period)
-        .mean()
+    # Shared layout settings
+    base_layout = dict(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Arial", size=12),
+        margin=dict(l=40, r=20, t=50, b=30),
     )
 
-    # --- Candlestick chart ---
-    fig = go.Figure(
-        data=[
-            go.Candlestick(
-                x=user_data.index,
-                open=user_data["Open"],
-                high=user_data["High"],
-                low=user_data["Low"],
-                close=user_data["Close"],
-            )
-        ]
+            # ────────── Similar / Opposite Tickers (side by side) ──────────
+    # Build a wide Close‐price DataFrame
+    close_wide = (
+        full_df[full_df["Type"] == "Close"]
+        .pivot(index="Date", columns="Ticker", values="Price")
+        .sort_index()
     )
-    fig.update_layout(
-        title="C A N D L E S T I C K   C H A R T",
+
+    # Correlate selected ticker against all others
+    target = close_wide[ticker]
+    corr   = close_wide.corrwith(target).dropna()
+    corr   = corr.drop(labels=[ticker], errors="ignore")
+
+    # Top 10 most alike and most opposite
+    similar  = corr.nlargest(10).index.tolist()
+    opposite = corr.nsmallest(10).index.tolist()
+
+    # Badge CSS
+    badge_style = (
+        "display:inline-block;"
+        "background-color:{bg};"
+        "color:#fff;"
+        "border-radius:4px;"
+        "padding:4px 8px;"
+        "margin:2px;"
+        "font-size:0.9em;"
+    )
+
+    # Two side-by-side columns
+    col_sim, col_opp = st.columns(2, gap="large")
+
+    with col_sim:
+        st.subheader("🔀 Similar Tickers")
+        st.markdown(
+            "".join(
+                f"<span style=\"{badge_style.format(bg='#4CAF50')}\">{t}</span>"
+                for t in similar
+            ),
+            unsafe_allow_html=True
+        )
+
+    with col_opp:
+        st.subheader("↔️ Opposite Tickers")
+        st.markdown(
+            "".join(
+                f"<span style=\"{badge_style.format(bg='#E74C3C')}\">{t}</span>"
+                for t in opposite
+            ),
+            unsafe_allow_html=True
+        )
+
+    # ─────────────────── Candlestick Chart (full width) ───────────────────
+    price_fig = go.Figure(data=[go.Candlestick(
+        x=user_data.index,
+        open=user_data["Open"],
+        high=user_data["High"],
+        low=user_data["Low"],
+        close=user_data["Close"],
+    )])
+    st.subheader("Candlestick Chart")
+    price_fig.update_layout(
         xaxis_title="Date",
         yaxis_title="Price ($)",
         xaxis_rangeslider_visible=False,
         height=550,
+        **base_layout
     )
-    
+    st.plotly_chart(price_fig, use_container_width=True)
 
-     # --- Volume bar chart + MA line ---
+    # ─────────────────── Prepare RSI & Volume+MA ───────────────────
+    # Compute Volume MA
+    user_data[f"Vol_MA_{ma_period}"] = user_data["Volume"].rolling(window=ma_period).mean()
+
+    # Volume + MA chart
     vol_fig = go.Figure()
-    # bars for raw volume
     vol_fig.add_trace(go.Bar(
         x=user_data.index,
         y=user_data["Volume"],
         name="Volume",
         marker_color="lightgrey",
     ))
-    # line for moving average
     vol_fig.add_trace(go.Scatter(
         x=user_data.index,
         y=user_data[f"Vol_MA_{ma_period}"],
@@ -192,34 +274,25 @@ if selected == "Individual Information":
         name=f"{ma_period}-Day MA",
         line=dict(width=2),
     ))
-
     vol_fig.update_layout(
-        title=f"Volume & {ma_period}-Day MA",
+        title=f"V O L U M E   &   {ma_period} - D A Y   M O V I N G   A V E R A G E",
         xaxis_title="Date",
         yaxis_title="Volume",
         legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
-        height=400
+        height=550,
+        **base_layout
     )
 
-    
-
-    # --- RSI calculation & chart ---
-    # 1) compute price changes
-    delta = user_data["Close"].diff()
-
-    # 2) separate gains and losses
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-
-    # 3) Wilder’s smoothing with α = 1/rsi_period
+    # Compute RSI
+    delta    = user_data["Close"].diff()
+    gain     = delta.where(delta > 0, 0)
+    loss     = -delta.where(delta < 0, 0)
     avg_gain = gain.ewm(alpha=1/rsi_period, min_periods=rsi_period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/rsi_period, min_periods=rsi_period, adjust=False).mean()
-
-    # 4) compute RSI
-    rs = avg_gain / avg_loss
+    rs       = avg_gain / avg_loss
     user_data["RSI"] = 100 - (100 / (1 + rs))
 
-    # 5) plot it
+    # RSI chart
     rsi_fig = go.Figure()
     rsi_fig.add_trace(go.Scatter(
         x=user_data.index,
@@ -227,188 +300,294 @@ if selected == "Individual Information":
         mode="lines",
         name=f"RSI ({rsi_period})"
     ))
-    # overbought / oversold lines
-    rsi_fig.add_hline(
-        y=70,
-        line_dash="dash",
-        line_color="white",
-        annotation_text="Overbought",
-        annotation_position="top left",
-        annotation_font_color="white"
-    )
-    rsi_fig.add_hline(
-        y=30,
-        line_dash="dash",
-        line_color="white",
-        annotation_text="Oversold",
-        annotation_position="bottom left",
-        annotation_font_color="white"
-    )
-
+    rsi_fig.add_hline(y=70, line_dash="dash", line_color="white",
+                      annotation_text="Overbought", annotation_position="top left",
+                      annotation_font_color="white")
+    rsi_fig.add_hline(y=30, line_dash="dash", line_color="white",
+                      annotation_text="Oversold", annotation_position="bottom left",
+                      annotation_font_color="white")
     rsi_fig.update_layout(
-        title=f"R E L A T I V E   S T R E N G T H   I N D E X",
+        title="R E L A T I V E   S T R E N G T H   I N D E X",
         xaxis_title="Date",
         yaxis_title="RSI",
         yaxis=dict(range=[0, 100]),
-        height=350,
+        height=550,
+        **base_layout
     )
-    base_layout = dict(
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(family="Arial", size=12),
-        margin=dict(l=40, r=20, t=50, b=30),
-    )
-    for figs in (fig, vol_fig, rsi_fig):
-        figs.update_layout(**base_layout)
-    
-    tabs = st.tabs(["📈 Price", "📊 Volume", "⚡ RSI"])
-    with tabs[0]:
-        st.plotly_chart(fig, use_container_width=True)
-    with tabs[1]:
-        st.plotly_chart(vol_fig, use_container_width=True)
-    with tabs[2]:
+
+    # ─────────────────── Display RSI & Volume side by side ───────────────────
+    col_rsi, col_vol = st.columns(2, gap="large")
+    with col_rsi:
         st.plotly_chart(rsi_fig, use_container_width=True)
-        
+    with col_vol:
+        st.plotly_chart(vol_fig, use_container_width=True)
 
 
-    # ────────────────────────  GENERAL INFORMATION  ─────────────────────────────────
+
+
+
+# ────────────────────────  GENERAL INFORMATION  ─────────────────────────────────
 if selected == "General Information":
-
-    # 1) Page title & sidebar controls
     st.title("GENERAL STOCK INFORMATION")
-    with st.sidebar:
-        st.header("🔎 Filters & Settings")
-        # • How many rows to show in Top/Bottom tables
-        top_n = st.slider("Rows to show", 5, 30, 10, step=5)
-        # • (Optional) Filter by Sector
-        sectors = st.multiselect("Sector filter", options=df_tickers["GICS Sector"].unique(), default=None)
-        # • (Optional) Filter by Industry
-        industries = st.multiselect("Industry filter", options=df_tickers["GICS Sub-Industry"].unique(), default=None)
 
-    # 2) Download today’s OHLCV for all tickers
-    with st.spinner("Fetching market data…"):
-        try:
-            all_data = yf.download(tickers.tolist(), period="1d", threads=True, progress=False)
-        except Exception as e:
-            st.error(f"Data fetch failed: {e}")
-            st.stop()
+    # ──────────── LOAD & PIVOT ────────────
+    full_df = load_stock_data_from_s3(bucket_name, s3_key)
+    wide = (
+        full_df
+        .pivot(index="Date", columns=["Ticker","Type"], values="Price")
+        .sort_index()
+    )
+    last_dt   = wide.index.max()
+    today     = wide.loc[last_dt]
+    yesterday = wide.iloc[-2]
 
-    # 3) Extract first (and only) row of Open/Close/Volume
-    if isinstance(all_data.columns, pd.MultiIndex):
-        opens  = all_data["Open"].iloc[0]
-        closes = all_data["Close"].iloc[0]
-        volumes= all_data["Volume"].iloc[0]
-    else:
-        opens  = pd.Series({tickers[0]: all_data["Open"].iloc[0]})
-        closes = pd.Series({tickers[0]: all_data["Close"].iloc[0]})
-        volumes= pd.Series({tickers[0]: all_data["Volume"].iloc[0]})
+    closes      = today.xs("Close",  level="Type")
+    prev_closes = yesterday.xs("Close", level="Type")
+    volumes     = today.xs("Volume", level="Type")
 
-    # 4) Build base DataFrame and apply filters
-    df = pd.DataFrame({"pct_change": (closes - opens) / opens, "volume": volumes})
+    # ─── BUILD METRIC DF (close→close) ─────────────────────────────
+    df = pd.DataFrame({
+        "pct_change": (closes - prev_closes) / prev_closes,
+        "volume":      volumes
+    })
     df.index = df.index.astype(str).str.upper()
-    # 4a) Join GICS metadata
-    meta = (df_tickers[["Symbol","GICS Sector","GICS Sub-Industry"]]
-              .assign(Symbol=lambda x: x["Symbol"].str.upper())
-              .set_index("Symbol"))
+
+    # Join in sector/industry metadata
+    meta = (
+        df_tickers[["Symbol","GICS Sector","GICS Sub-Industry"]]
+        .assign(Symbol=lambda x: x["Symbol"].str.upper())
+        .set_index("Symbol")
+    )
     df = df.join(meta, how="left").dropna(subset=["GICS Sector","GICS Sub-Industry"])
-    # 4b) Apply sidebar filters if any
-    if sectors:
-        df = df[df["GICS Sector"].isin(sectors)]
-    if industries:
-        df = df[df["GICS Sub-Industry"].isin(industries)]
-    if df.empty:
-        st.warning("No data after applying filters.")
-        st.stop()
 
-    # 5) Aggregations for metrics
-    sector_perf   = df.groupby("GICS Sector")["pct_change"].mean()
-    industry_perf = df.groupby("GICS Sub-Industry")["pct_change"].mean()
-    top_sector    = sector_perf.idxmax()
-    bottom_sector = sector_perf.idxmin()
-    top_industry  = industry_perf.idxmax()
-    bottom_industry=industry_perf.idxmin()
-    total_volume  = df["volume"].sum() / 1_000_000  # in millions
+    # ─────────────────── BUILD SECTOR & INDUSTRY INDEX SERIES ───────────────────
+    close_wide = (
+        full_df[full_df["Type"] == "Close"]
+        .pivot(index="Date", columns="Ticker", values="Price")
+        .sort_index()
+    )
+    sector_map    = df_tickers.set_index("Symbol")["GICS Sector"].to_dict()
+    subind_map    = df_tickers.set_index("Symbol")["GICS Sub-Industry"].to_dict()
+    sector_index  = close_wide.groupby(sector_map, axis=1).mean()
+    subind_index  = close_wide.groupby(subind_map, axis=1).mean()
 
-    # 6) KPI cards (“At a glance”)
-    row1, row2, row3 = st.columns([1,1,2], gap="small")
+    # overnight % change of those indices
+    sector_pct_idx = (sector_index.iloc[-1] - sector_index.iloc[-2]) / sector_index.iloc[-2]
+    subind_pct_idx = (subind_index.iloc[-1] - subind_index.iloc[-2]) / subind_index.iloc[-2]
+
+    # ─────────────────── AGGREGATIONS & KPI CARDS ─────────────────────────────
+    top_sector      = sector_pct_idx.idxmax()
+    bottom_sector   = sector_pct_idx.idxmin()
+    top_industry    = subind_pct_idx.idxmax()
+    bottom_industry = subind_pct_idx.idxmin()
+    total_volume    = df["volume"].sum() / 1_000_000  # millions
+
+    row1, row2, row3 = st.columns([3,3,1], gap="large")
     with row1:
-        st.metric("🏆 Top Sector",   top_sector,    f"{sector_perf[top_sector]:.2%}")
-        st.metric("🥇 Top Industry", top_industry,  f"{industry_perf[top_industry]:.2%}")
+        st.metric("🏆 Top Sector",    top_sector,       f"{sector_pct_idx[top_sector]:.2%}")
+        st.metric("🥇 Top Industry",  top_industry,     f"{subind_pct_idx[top_industry]:.2%}")
     with row2:
-        st.metric("🏴 Bottom Sector", bottom_sector, f"{sector_perf[bottom_sector]:.2%}")
-        st.metric("🥈 Bottom Industry",bottom_industry, f"{industry_perf[bottom_industry]:.2%}")
+        st.metric("🏴 Bottom Sector", bottom_sector,    f"{sector_pct_idx[bottom_sector]:.2%}")
+        st.metric("🥈 Bottom Industry", bottom_industry,f"{subind_pct_idx[bottom_industry]:.2%}")
     with row3:
         st.metric("📊 Total Volume (M)", f"{total_volume:.2f}")
-
     st.caption(f"Data last updated: {datetime.datetime.now():%b %d, %Y – %H:%M:%S}")
-    
-    # ─── 8) Top/Bottom N performers tables ─────────────────────────────────────
-    # 8a) Prepare tables
-    perf = df.assign(Price=closes)[["Price","pct_change"]].rename(columns={"pct_change":"% Change"})
+
+    st.markdown("---")
+
+    # ─────────────────── TOP / BOTTOM TABLES ───────────────────────────────────
+    top_n = 10
+    perf = (
+        df
+        .assign(Price=closes)
+        [["Price","pct_change"]]
+        .rename(columns={"pct_change":"% Change"})
+    )
     topN    = perf.sort_values("% Change", ascending=False).head(top_n)
     bottomN = perf.sort_values("% Change", ascending=True).head(top_n)
 
-    # 8b) Render in Expanders side-by-side
-    exp1, exp2 = st.columns(2)
-    with exp1:
-        with st.expander(f"📈 Top {top_n} Gainers"):
-            styled = (topN.style
-                        .format({"Price":"${:,.2f}","% Change":"{:.2%}"})
-                        .applymap(lambda v: "color: green", subset=["% Change"]))
-            st.dataframe(styled, use_container_width=True)
-    with exp2:
-        with st.expander(f"📉 Top {top_n} Losers"):
-            styled = (bottomN.style
-                        .format({"Price":"${:,.2f}","% Change":"{:.2%}"})
-                        .applymap(lambda v: "color: red", subset=["% Change"]))
-            st.dataframe(styled, use_container_width=True)
+    cols = st.columns(2, gap="large")
+    with cols[0]:
+        st.subheader(f"📈 Top {top_n} Gainers")
+        styled_top = (
+            topN.style
+                .format({"Price":"${:,.2f}","% Change":"{:.2%}"})
+                .applymap(lambda v: "color: green", subset=["% Change"])
+        )
+        st.dataframe(styled_top, use_container_width=True)
 
-# ───────────────────────────────  NEWS  ─────────────────────────────────────────
+    with cols[1]:
+        st.subheader(f"📉 Top {top_n} Losers")
+        styled_bot = (
+            bottomN.style
+                .format({"Price":"${:,.2f}","% Change":"{:.2%}"})
+                .applymap(lambda v: "color: red", subset=["% Change"])
+        )
+        st.dataframe(styled_bot, use_container_width=True)
+    
+    st.markdown("---")
+
+    # ─────────────────── SECTOR ROTATION & TODAY’S PERFORMANCE ───────────────────
+    # now lay out the two charts side by side
+    col1, col2 = st.columns(2, gap="large")
+
+    # — Left: rolling‐window line chart —
+    with col1:
+        # nest a row for the title + selector
+        title_col, select_col = st.columns([4,1], gap="small")
+        with title_col:
+            st.subheader("Sector Rotations")
+        with select_col:
+            label = st.selectbox(
+            "",
+            ["7 days", "15 days", "30 days", "60 days", "120 days"],
+            index=2,
+            help="Show % change over the last N days"
+        )
+        # pull the numeric value back out
+        window = int(label.split()[0])
+        # compute rolling pct change
+        sector_pct = sector_index.pct_change(periods=window) * 100
+        start_date = sector_pct.index.max() - pd.Timedelta(days=window)
+        sector_pct = sector_pct.loc[start_date:]
+
+        fig1 = px.line(
+            sector_pct,
+            x=sector_pct.index,
+            y=sector_pct.columns,
+            labels={"value":"% Change", "Date":"Date"}
+        )
+        fig1.update_layout(
+        margin=dict(t=40, l=0, r=0, b=0),
+        legend=dict(
+        orientation="h",
+        yanchor="bottom",
+        y=1.02,
+        xanchor="left",
+        x=0
+        ),
+        showlegend=True
+        )
+        st.plotly_chart(fig1, use_container_width=True)
+
+    # — Right: today’s bar chart —
+    with col2:
+        st.subheader("Sector Performance Today")
+        bar_df = (
+            sector_pct_idx
+            .rename_axis("Sector")
+            .reset_index(name="Pct Change")
+            .sort_values("Pct Change", ascending=False)  # best at top
+        )
+        mx = bar_df["Pct Change"].abs().max()
+
+        fig2 = px.bar(
+            bar_df,
+            x="Pct Change",
+            y="Sector",
+            orientation="h",
+            color="Pct Change",
+            range_color=[-mx, mx],
+            color_continuous_scale=["#b22222","lightgray","#228b22"],
+            title="Today’s % Change by Sector",
+        )
+        # hide colorbar, sort categories, format axis as %
+        fig2.update_coloraxes(showscale=False)
+        fig2.update_layout(
+            yaxis={"categoryorder":"total ascending"},
+            margin=dict(t=40, l=0, r=0, b=0),
+            showlegend=False
+        )
+        fig2.update_xaxes(tickformat=".1%")  # display e.g. 1.5% instead of 0.015
+
+        st.plotly_chart(fig2, use_container_width=True)
+
+
+        
+# ───────────────────────────────  NEWS  ─────────────────────────────────────────
 if selected == "News":
+    # --- Configuration ---
+    POSITIVE_THRESHOLD = 0.1
+    NEGATIVE_THRESHOLD = -0.1
+
     # Sidebar controls
     with st.sidebar:
         st.header("🔍 News Settings")
-        ticker = st.selectbox("Ticker", tickers, index=0)
-        days = st.number_input(
-            "Fetch news from last…", min_value=1, max_value=90, value=7, step=1
-        )
-        max_articles = st.slider("Max articles to show", 5, 20, 10, step=5)
-        keyword_filter = st.text_input("Filter by keyword", "")
+        ticker         = st.selectbox("Ticker", tickers, index=tickers.index("AAPL"))
+        days           = st.number_input("Fetch news from last… (days)", min_value=1, max_value=90, value=7, step=1)
+        keyword_filter = st.text_input("Filter by keyword (optional)", "")
 
     company = ticker_to_name.get(ticker, "")
     st.header(f"📰 Recent News for {ticker} (last {days} days)")
 
-    # Fetch news with spinner
+    # Fetch & filter
     with st.spinner(f"Loading news for {ticker}…"):
         df_news = load_news(ticker, company, days=days)
-
     if df_news.empty:
-        st.info("No recent news found. Try increasing the date range or changing ticker.")
+        st.info("No recent news found. Try increasing the date range or changing the ticker.")
         st.stop()
-
-    # Optional keyword filtering
     if keyword_filter:
-        df_news = df_news[df_news["title"]
-                          .str.contains(keyword_filter, case=False, na=False)]
+        df_news = df_news[
+            df_news["title"].str.contains(keyword_filter, case=False, na=False) |
+            df_news["summary"].str.contains(keyword_filter, case=False, na=False)
+        ]
         if df_news.empty:
             st.warning(f"No articles found containing '{keyword_filter}'.")
             st.stop()
 
+    # We will analyze and display the top 10 articles
+    df_display = df_news.head(10).copy()
 
-    # Display top N articles
-    for i, row in df_news.head(max_articles).iterrows():
-        # Clickable title
-        st.markdown(f"### [{row['title']}]({row['url']})")
-        # Publisher & date metadata
-        st.markdown(
-            f"**{row['publisher']}** · {row['published'].strftime('%b %d, %Y')}",
-            unsafe_allow_html=True,
+    # ───────── SENTIMENT ANALYSIS ─────────────────
+    df_display["text_for_analysis"] = (
+        df_display["title"].astype(str) + ". " +
+        df_display["summary"].astype(str)
+    )
+    sentiments = df_display["text_for_analysis"].apply(lambda txt: TextBlob(txt).sentiment)
+    df_display["polarity"]     = sentiments.apply(lambda s: s.polarity)
+    avg_polarity = df_display["polarity"].mean()
+
+    # Decide overall feeling based on average polarity
+    if avg_polarity > POSITIVE_THRESHOLD:
+        feeling = "Positive"
+        advice_fn = st.success
+        advice    = f"✅ The average sentiment of the top {len(df_display)} articles is Positive."
+    elif avg_polarity < NEGATIVE_THRESHOLD:
+        feeling = "Negative"
+        advice_fn = st.error
+        advice    = f"⚠️ The average sentiment of the top {len(df_display)} articles is Negative."
+    else:
+        feeling = "Neutral"
+        advice_fn = st.warning
+        advice    = f"ℹ️ The average sentiment of the top {len(df_display)} articles is Neutral."
+
+    # --- Display Metrics and Advice ---
+    m1, m2, m3 = st.columns([1, 1, 2], gap="medium")
+    m1.metric("Avg. Polarity",      f"{avg_polarity:.3f}", help="Sentiment score from -1 to +1")
+    m2.metric("Overall Feeling",    feeling)
+    with m3:
+        advice_fn(advice)
+    st.info(
+        "💡 **Disclaimer:** This sentiment analysis is automated and for informational purposes only.",
+        icon="ℹ️"
+    )
+    st.markdown("---")
+
+    # --- Display Articles (title, source, date only) ---
+    st.subheader(f"Top {len(df_display)} Articles")
+    for _, row in df_display.iterrows():
+        st.markdown(f"##### [{row['title']}]({row['url']})")
+        st.caption(
+            f"**Publisher:** {row['publisher']}   |   "
+            f"**Published:** {row['published'].strftime('%b %d, %Y')}"
         )
+        st.markdown("")  # small spacer
 
-    # Download button
+    # Download button for the full fetched list
     st.download_button(
-        "Download News as CSV",
-        df_news.to_csv(index=False),
-        file_name=f"{ticker}_news.csv",
+        "Download All News as CSV",
+        df_news.to_csv(index=False).encode('utf-8'),
+        file_name=f"{ticker}_news_{datetime.date.today()}.csv",
         mime="text/csv",
     )
+
