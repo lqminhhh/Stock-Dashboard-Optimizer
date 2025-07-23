@@ -180,7 +180,7 @@ if selected == "Individual Information":
     low_date         = df_tkr["Low"].idxmin().strftime("%B %d, %Y")
 
     # 5) KPI cards
-    c_company, c1, c2, c3, c4, c5 = st.columns([1,1,1,1,1,1], gap="large")
+    c_company, c1, c2, c3, c4, c5 = st.columns([1,1,1,1,1,1], gap="large", border=True)
     with c_company:
         st.metric("Company", company_name)
     with c1:
@@ -242,7 +242,7 @@ if selected == "Individual Information":
     )
 
     # Two side-by-side columns
-    col_sim, col_opp = st.columns(2, gap="large")
+    col_sim, col_opp = st.columns(2, gap="large", border=True)
 
     with col_sim:
         st.subheader("🔀 Similar Tickers")
@@ -343,7 +343,7 @@ if selected == "Individual Information":
     )
 
     # ─────────────────── Display RSI & Volume side by side ───────────────────
-    col_rsi, col_vol = st.columns(2, gap="large")
+    col_rsi, col_vol = st.columns(2, gap="large", border=True)
     with col_rsi:
         st.plotly_chart(rsi_fig, use_container_width=True)
     with col_vol:
@@ -408,12 +408,14 @@ if selected == "General Information":
     top_industry    = subind_pct_idx.idxmax()
     bottom_industry = subind_pct_idx.idxmin()
 
-    row1, row2 = st.columns([2, 2], gap="large")
+    row1, row2, row3, row4 = st.columns([2, 1, 2, 1], gap="large", border=True)
     with row1:
         st.metric("🏆 Top Sector",    top_sector,       f"{sector_pct_idx[top_sector]:.2%}")
-        st.metric("🏴 Bottom Sector", bottom_sector,    f"{sector_pct_idx[bottom_sector]:.2%}")
     with row2:
+        st.metric("🏴 Bottom Sector", bottom_sector,    f"{sector_pct_idx[bottom_sector]:.2%}")
+    with row3:
         st.metric("🥇 Top Industry",  top_industry,     f"{subind_pct_idx[top_industry]:.2%}")
+    with row4:
         st.metric("🥈 Bottom Industry", bottom_industry,f"{subind_pct_idx[bottom_industry]:.2%}")
     st.caption(f"Data last updated: {datetime.datetime.now():%b %d, %Y – %H:%M:%S}")
 
@@ -430,7 +432,7 @@ if selected == "General Information":
     topN    = perf.sort_values("% Change", ascending=False).head(top_n)
     bottomN = perf.sort_values("% Change", ascending=True).head(top_n)
 
-    cols = st.columns(2, gap="large")
+    cols = st.columns(2, gap="large", border=True)
     with cols[0]:
         st.subheader(f"📈 Top {top_n} Gainers")
         styled_top = (
@@ -587,7 +589,7 @@ if selected == "News":
         advice    = f"ℹ️ The average sentiment of the top {len(df_display)} articles is Neutral."
 
     # --- Display Metrics and Advice ---
-    m1, m2, m3 = st.columns([1, 1, 2], gap="medium")
+    m1, m2, m3 = st.columns([1, 1, 2], gap="medium", border=True)
     m1.metric("Avg. Polarity",      f"{avg_polarity:.3f}", help="Sentiment score from -1 to +1")
     m2.metric("Overall Feeling",    feeling)
     with m3:
@@ -613,7 +615,7 @@ if selected == "News":
         )
         st.markdown("")  # small spacer
 
-    # Download button for the full fetched list
+    # Download button for the full fetched lista
     st.download_button(
         "Download All News as CSV",
         df_news.to_csv(index=False).encode('utf-8'),
@@ -673,7 +675,7 @@ if selected == 'Portfolio Optimizer':
         st.subheader(summary_text)
 
         st.subheader("📊 Portfolio Metrics")
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3, col4, col5 = st.columns(5, border=True)
         col1.metric("Expected Return", f"{result['expected_return']:.2%}")
         col2.metric("Volatility", f"{result['volatility']:.2%}")
         col3.metric("Sharpe Ratio", f"{result['sharpe_ratio']:.2f}")
