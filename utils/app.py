@@ -8,8 +8,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 from concurrent.futures import ThreadPoolExecutor, as_completed
-# from pygooglenews import GoogleNews
-from GoogleNews import GoogleNews
+from pygooglenews import GoogleNews
 import os
 import boto3
 import json
@@ -70,8 +69,9 @@ ticker_to_name = dict(zip(df_tickers["Symbol"], df_tickers["Security"]))
 
 # ─────────────────────── S3 SNAPSHOT CONFIG ──────────────────────────────────
 bucket_name = "yfinancestockdata"
-s3_key      = "snapshots/stock_data_2023-01-01_to_2025-06-29.csv"
+s3_key      = "snapshots/stock_data_2015-01-01_to_2025-07-26.csv"
 
+full_df  = load_stock_data_from_s3(bucket_name, s3_key)
 # ──────────────────────────────  SIDEBAR  ────────────────────────────────────────
 
 with st.sidebar:
@@ -79,7 +79,6 @@ with st.sidebar:
         menu_title="Navigation",
         options=["General Information", "Individual Information", "News", "Portfolio Optimizer"],
         icons=["bar-chart-line", "list-columns-reverse", "newspaper", "gear"],
-        menu_icon="cast",
         default_index=0,
     )
     st.markdown("---")
@@ -88,60 +87,31 @@ with st.sidebar:
 @st.cache_data
 def load_news(tkr: str, company: str, days: int = 7) -> pd.DataFrame:
     query = f'{tkr} stock "{company}"'
-    # gn = GoogleNews()
-    # search = gn.search(query, when=f"{days}d")
+    gn = GoogleNews()
+    search = gn.search(query, when=f"{days}d")
 
-    # if not search["entries"]:
-    #     return pd.DataFrame()
-
-    # df = pd.DataFrame(search["entries"]).rename(columns={"link": "url"})
-    # df["published"] = pd.to_datetime(df["published"], errors="coerce")
-    # df["publisher"] = df["source"].apply(
-    #     lambda s: s.get("title", "N/A") if isinstance(s, dict) else "N/A"
-    # )
-
-    # final_cols = ["title", "summary", "publisher", "published", "url"]
-    # for col in final_cols:
-    #     if col not in df.columns:
-    #         df[col] = "N/A"
-
-    # return df[final_cols]
-    gn = GoogleNews(lang='en', period=f"{days}d")
-    gn.search(query)
-    results = gn.results()
-
-    if not results:
+    if not search["entries"]:
         return pd.DataFrame()
 
-    df = pd.DataFrame(results)
-
-    # Normalize and rename columns
-    df = df.rename(columns={
-        "link": "url",
-        "media": "publisher",
-        "date": "published"
-    })
-
-    # Convert published date to datetime
+    df = pd.DataFrame(search["entries"]).rename(columns={"link": "url"})
     df["published"] = pd.to_datetime(df["published"], errors="coerce")
+    df["publisher"] = df["source"].apply(
+        lambda s: s.get("title", "N/A") if isinstance(s, dict) else "N/A"
+      )
 
-    # Ensure all required columns exist
-    final_cols = ["title", "desc", "publisher", "published", "url"]
+    final_cols = ["title", "summary", "publisher", "published", "url"]
     for col in final_cols:
         if col not in df.columns:
-            df[col] = "N/A"
+              df[col] = "N/A"
 
-    # Rename "desc" to "summary" to match original function
-    df = df.rename(columns={"desc": "summary"})
-
-    return df[["title", "summary", "publisher", "published", "url"]]
+    return df[final_cols]
+    
 
 # ─────────────────────  INDIVIDUAL INFORMATION  ─────────────────────────────────
 if selected == "Individual Information":
     st.title("DETAILED STOCK INFORMATION")
 
-    # 1) Load full history so we know our date bounds
-    full_df  = load_stock_data_from_s3(bucket_name, s3_key)
+
     min_date = full_df["Date"].min().date()
     max_date = full_df["Date"].max().date()
 
@@ -180,7 +150,7 @@ if selected == "Individual Information":
     low_date         = df_tkr["Low"].idxmin().strftime("%B %d, %Y")
 
     # 5) KPI cards
-    c_company, c1, c2, c3, c4, c5 = st.columns([1,1,1,1,1,1], gap="large", border=True)
+    c_company, c1, c2, c3, c4, c5 = st.columns([2,1,1,1,1,1], gap="large", border=True)
     with c_company:
         st.metric("Company", company_name)
     with c1:
@@ -280,7 +250,7 @@ if selected == "Individual Information":
         height=550,
         **base_layout
     )
-    st.plotly_chart(price_fig, use_container_width=True)
+    st.plotly_chart(price_fig, use_container_width=True, border=True)
 
     # ─────────────────── Prepare RSI & Volume+MA ───────────────────
     # Compute Volume MA
@@ -358,7 +328,6 @@ if selected == "General Information":
     st.title("GENERAL STOCK INFORMATION")
 
     # ──────────── LOAD & PIVOT ────────────
-    full_df = load_stock_data_from_s3(bucket_name, s3_key)
     wide = (
         full_df
         .pivot(index="Date", columns=["Ticker","Type"], values="Price")
@@ -408,7 +377,7 @@ if selected == "General Information":
     top_industry    = subind_pct_idx.idxmax()
     bottom_industry = subind_pct_idx.idxmin()
 
-    row1, row2, row3, row4 = st.columns([2, 1, 2, 1], gap="large", border=True)
+    row1, row2, row3, row4 = st.columns([2, 2, 2, 2], gap="small", border=True)
     with row1:
         st.metric("🏆 Top Sector",    top_sector,       f"{sector_pct_idx[top_sector]:.2%}")
     with row2:
@@ -561,8 +530,8 @@ if selected == "News":
             st.warning(f"No articles found containing '{keyword_filter}'.")
             st.stop()
 
-    # We will analyze and display the top 50 articles
-    df_display = df_news.head(50).copy()
+    # We will analyze and display the top 10 articles
+    df_display = df_news.head(10).copy()
 
     # ───────── SENTIMENT ANALYSIS ─────────────────
     df_display["text_for_analysis"] = (
@@ -640,47 +609,56 @@ if selected == 'Portfolio Optimizer':
     else:
         max_volatility = st.sidebar.number_input("Optional: Maximum Volatility (%)", min_value=0.0, max_value=100.0, step=0.1, value=20.0) / 100
     
-    full_df  = load_stock_data_from_s3(bucket_name, s3_key)
     tickers = sorted(full_df['Ticker'].unique().tolist())
     selected_tickers = st.multiselect("Select tickers to include in the portfolio:", tickers, default=tickers[:8])
+
+    if len(selected_tickers) < 2:
+        st.warning("⚠️ Please select at least two tickers to run the optimization.")
+        st.stop()
 
     if selected_tickers:
         df_prepped = prep_data(full_df, selected_tickers)
 
-        if optimizer_type == "Minimize Risk":
-            result = optimize_min_variance(
-                df_prepped,
-                capital=capital,
-                allow_short=allow_short,
-                min_return=min_return if min_return > 0 else None,
-                verbose=False
+    if selected_tickers:
+        df_prepped = prep_data(full_df, selected_tickers)
+        try:
+            if optimizer_type == "Minimize Risk":
+                result = optimize_min_variance(
+                    df_prepped,
+                    capital=capital,
+                    allow_short=allow_short,
+                    min_return=min_return if min_return > 0 else None,
+                    verbose=False
+                )
+            else:
+                result = optimize_max_return(
+                    df_prepped,
+                    capital=capital,
+                    allow_short=allow_short,
+                    max_volatility=max_volatility,
+                    verbose=False
+                )
+            # Friendly summary
+            total_return_dollars = result["expected_return"] * capital
+            summary_text = (
+                f"💡 If you invest \${capital:}, your optimized portfolio is expected to earn "
+                f"**${total_return_dollars:,.2f} annually**, with a projected return of **{result['expected_return']:.2%}** "
+                f"and risk (volatility) of **{result['volatility']:.2%}**.\n\n"
+                f"Here's how your capital would be allocated across the selected stocks:"
             )
-        else:
-            result = optimize_max_return(
-                df_prepped,
-                capital=capital,
-                allow_short=allow_short,
-                max_volatility=max_volatility,
-                verbose=False
-            )
-        # Friendly summary
-        total_return_dollars = result["expected_return"] * capital
-        summary_text = (
-            f"💡 If you invest \${capital:}, your optimized portfolio is expected to earn "
-            f"**${total_return_dollars:,.2f} annually**, with a projected return of **{result['expected_return']:.2%}** "
-            f"and risk (volatility) of **{result['volatility']:.2%}**.\n\n"
-            f"Here's how your capital would be allocated across the selected stocks:"
-        )
 
-        st.subheader(summary_text)
+            st.subheader(summary_text)
 
-        st.subheader("📊 Portfolio Metrics")
-        col1, col2, col3, col4, col5 = st.columns(5, border=True)
-        col1.metric("Expected Return", f"{result['expected_return']:.2%}")
-        col2.metric("Volatility", f"{result['volatility']:.2%}")
-        col3.metric("Sharpe Ratio", f"{result['sharpe_ratio']:.2f}")
-        col4.metric("Value at Risk (5%)", f"-{abs(result['VaR_5']):.2%}")
-        col5.metric("Conditional VaR (5%)", f"-{abs(result['CVaR_5']):.2%}")
+            st.subheader("📊 Portfolio Metrics")
+            col1, col2, col3, col4, col5 = st.columns(5, border=True)
+            col1.metric("Expected Return", f"{result['expected_return']:.2%}")
+            col2.metric("Volatility", f"{result['volatility']:.2%}")
+            col3.metric("Sharpe Ratio", f"{result['sharpe_ratio']:.2f}")
+            col4.metric("Value at Risk (5%)", f"-{abs(result['VaR_5']):.2%}")
+            col5.metric("Conditional VaR (5%)", f"-{abs(result['CVaR_5']):.2%}")
 
-        st.subheader("📈 Optimized Portfolio Allocation")
-        st.dataframe(result["allocations"].style.format({"Dollars": "$ {:.2f}", "Weight": "{:.2%}"}))
+            st.subheader("📈 Optimized Portfolio Allocation")
+            st.dataframe(result["allocations"].style.format({"Dollars": "$ {:.2f}", "Weight": "{:.2%}"}))
+        except Exception as e:
+            st.error(f"An error occurred during optimization: {e}")
+            st.warning("This can happen if selected stocks are highly correlated. Please try a different combination.")
